@@ -6,6 +6,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 
+if ! compgen -G "/opt/mudfish/*/bin/mudrun-headless" > /dev/null; then
+    echo "Mudfish doesn't seem to be installed (no /opt/mudfish/*/bin/mudrun-headless found)."
+    echo "Install it first from https://mudfish.net/download, then re-run this script."
+    exit 1
+fi
+
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtualenv at $VENV_DIR"
     python3 -m venv "$VENV_DIR"
@@ -18,7 +24,7 @@ echo "Installing dependencies"
 ICON="$(compgen -G "/opt/mudfish/*/share/mudrun_logo.png" | sort -V | tail -n1 || true)"
 ICON="${ICON:-network-vpn}"
 
-APPS_DIR="$HOME/.local/share/applications"
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 mkdir -p "$APPS_DIR"
 DESKTOP_FILE="$APPS_DIR/mudfish-tray.desktop"
 
