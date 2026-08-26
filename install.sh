@@ -7,8 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 
 if ! compgen -G "/opt/mudfish/*/bin/mudrun-headless" > /dev/null; then
-    echo "Mudfish doesn't seem to be installed (no /opt/mudfish/*/bin/mudrun-headless found)."
-    echo "Install it first from https://mudfish.net/download, then re-run this script."
+    echo "Mudfish doesn't seem to be installed (no /opt/mudfish/*/bin/mudrun-headless found)." >&2
+    echo "Install it first from https://mudfish.net/download, then re-run this script." >&2
     exit 1
 fi
 
@@ -37,11 +37,9 @@ Exec=$VENV_DIR/bin/python $SCRIPT_DIR/tray.py
 Icon=$ICON
 Terminal=false
 Categories=Network;
-X-GNOME-Autostart-enabled=true
 EOF
 
 chmod +x "$DESKTOP_FILE"
 
 echo "Installed $DESKTOP_FILE"
-echo "Launch \"Mudfish Tray\" from your application menu, or add it to your"
-echo "desktop environment's autostart/startup applications to run it on login."
+echo "Launch \"Mudfish Tray\" from your application menu."
