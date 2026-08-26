@@ -1,0 +1,3 @@
+dbus-next
+pillow
+platformdirs
