@@ -8,7 +8,12 @@ process (no pattern-matching pkill needed). Exits — and stops mudrun-headless
 — as soon as the tray disconnects or sends "quit", so nothing outlives the
 tray session.
 
-Usage: mudfish-broker.py <socket_path> <log_path> <allowed_uid>
+Usage: mudfish-broker.py <socket_path> <log_path> <allowed_uid> [mudfish_home]
+
+mudfish_home, if given, is used as-is instead of auto-detecting the newest
+install under /opt/mudfish — this is how tray.py forwards its own
+(possibly --mudfish-home-overridden) choice, so both processes agree on
+which Mudfish install to run.
 """
 import asyncio
 import os
@@ -17,22 +22,15 @@ import socket
 import struct
 import sys
 import time
-from glob import glob
 
-BINARY_GLOB = "/opt/mudfish/*/bin/mudrun-headless"
-
-
-def _mudfish_version_key(path):
-    # path looks like /opt/mudfish/<version>/bin/mudrun-headless; sort by the
-    # version's numeric components so e.g. 6.10.0 correctly outranks 6.9.0
-    # (plain string sorting would put "6.10.0" before "6.9.0").
-    version = path.split("/opt/mudfish/", 1)[-1].split("/", 1)[0]
-    return tuple(int(part) if part.isdigit() else part for part in version.split("."))
+import mudfish_home
 
 
 def find_binary():
-    matches = glob(BINARY_GLOB)
-    return max(matches, key=_mudfish_version_key, default=None)
+    if not mudfish_home.MUDFISH_BIN_DIR:
+        return None
+    path = os.path.join(mudfish_home.MUDFISH_BIN_DIR, "mudrun-headless")
+    return path if os.path.isfile(path) else None
 
 
 class Broker:
@@ -189,6 +187,8 @@ class Broker:
 
 def main():
     socket_path, log_path, allowed_uid = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    home_override = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+    mudfish_home.configure(home_override)
     broker = Broker(socket_path, log_path, allowed_uid)
     try:
         asyncio.run(broker.run())

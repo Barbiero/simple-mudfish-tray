@@ -11,25 +11,26 @@ running), starting/stopping (pending, transitional), started
 (mudrun-headless is up but no VPN item is active), and running
 (mudrun-headless is up and a VPN item is active). The last distinction is
 made by watching, via inotify, for the appearance/disappearance of
-{mudfish_folder}/var/.mudfish.vsm — the same file mudadm itself uses to
+{mudfish_home}/var/.mudfish.vsm — the same file mudadm itself uses to
 detect a running item — since that file is world-readable and needs no
 broker/root involvement."""
+import argparse
 import asyncio
-import ctypes
 import os
 import signal
-import struct
 import sys
 import time
 import webbrowser
-from glob import glob
 
+from inotify_simple import INotify, flags as inotify_flags
 from PIL import Image, ImageDraw
 from platformdirs import user_cache_dir, user_runtime_dir
 
 from dbus_next import BusType, PropertyAccess, Variant
 from dbus_next.aio import MessageBus
 from dbus_next.service import ServiceInterface, dbus_property, method, signal as dbus_signal
+
+import mudfish_home
 
 BROKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker.py")
 DEBUG = os.environ.get("MUDFISH_TRAY_DEBUG") == "1"
@@ -62,28 +63,6 @@ def log(msg):
         pass
 
 
-def _mudfish_version_key(path):
-    # path looks like /opt/mudfish/<version>/share/mudrun_logo.png; sort by the
-    # version's numeric components so e.g. 6.10.0 correctly outranks 6.9.0
-    # (plain string sorting would put "6.10.0" before "6.9.0").
-    version = path.split("/opt/mudfish/", 1)[-1].split("/", 1)[0]
-    return tuple(int(part) if part.isdigit() else part for part in version.split("."))
-
-
-def find_logo():
-    matches = glob("/opt/mudfish/*/share/mudrun_logo.png")
-    return max(matches, key=_mudfish_version_key, default=None)
-
-
-def find_vsm_path():
-    matches = glob("/opt/mudfish/*/bin/mudrun-headless")
-    binary = max(matches, key=_mudfish_version_key, default=None)
-    if not binary:
-        return None
-    mudfish_folder = os.path.dirname(os.path.dirname(binary))
-    return os.path.join(mudfish_folder, "var", ".mudfish.vsm")
-
-
 def rgba_to_argb_bytes(im):
     raw = im.tobytes()  # R,G,B,A per pixel
     out = bytearray(len(raw))
@@ -95,14 +74,11 @@ def rgba_to_argb_bytes(im):
 
 
 def load_base_icon():
-    path = find_logo()
     size = (64, 64)
-    if path:
-        im = Image.open(path).convert("RGBA")
-        im = im.resize(size)
-    else:
-        im = Image.new("RGBA", size, (100, 100, 100, 255))
-    return im
+    path = os.path.join(mudfish_home.MUDFISH_SHARE_DIR, "mudrun_logo.png") if mudfish_home.MUDFISH_SHARE_DIR else None
+    if path and os.path.isfile(path):
+        return Image.open(path).convert("RGBA").resize(size)
+    return Image.new("RGBA", size, (100, 100, 100, 255))
 
 
 def make_pixmap(base_img, color, fill_alpha=None):
@@ -129,64 +105,44 @@ def make_pixmap(base_img, color, fill_alpha=None):
     return [[w, h, rgba_to_argb_bytes(im)]]
 
 
-_libc = ctypes.CDLL("libc.so.6", use_errno=True)
-_IN_NONBLOCK = 0o4000
-_IN_CREATE = 0x00000100
-_IN_DELETE = 0x00000200
-_IN_MOVED_FROM = 0x00000040
-_IN_MOVED_TO = 0x00000080
-_VSM_WATCH_MASK = _IN_CREATE | _IN_DELETE | _IN_MOVED_FROM | _IN_MOVED_TO
-_INOTIFY_EVENT = struct.Struct("iIII")  # wd, mask, cookie, name_len
-
-
 class VsmWatcher:
     """Watches a directory via inotify for one file's creation/removal,
     so we can tell whether a VPN item is running without polling (e.g. via
     `ls`) or shelling out to `mudadm`."""
 
+    _WATCH_FLAGS = inotify_flags.CREATE | inotify_flags.DELETE | inotify_flags.MOVED_TO | inotify_flags.MOVED_FROM
+
     def __init__(self, on_change):
         self._on_change = on_change
-        self._fd = None
+        self._inotify = None
         self._dir = None
         self._filename = None
         self.exists = False
 
     def is_active(self):
-        return self._fd is not None
+        return self._inotify is not None
 
     def start(self, path):
         self._dir, self._filename = os.path.split(path)
         self.exists = os.path.exists(path)
 
-        fd = _libc.inotify_init1(_IN_NONBLOCK)
-        if fd < 0:
-            log(f"inotify_init1 failed: {os.strerror(ctypes.get_errno())}")
+        try:
+            inotify = INotify(nonblocking=True)
+        except OSError as e:
+            log(f"could not open inotify: {e}")
             return
-        wd = _libc.inotify_add_watch(fd, self._dir.encode(), _VSM_WATCH_MASK)
-        if wd < 0:
-            log(f"could not watch {self._dir} for VPN state: {os.strerror(ctypes.get_errno())}")
-            os.close(fd)
+        try:
+            inotify.add_watch(self._dir, self._WATCH_FLAGS)
+        except OSError as e:
+            log(f"could not watch {self._dir} for VPN state: {e}")
+            inotify.close()
             return
 
-        self._fd = fd
-        asyncio.get_running_loop().add_reader(fd, self._on_readable)
+        self._inotify = inotify
+        asyncio.get_running_loop().add_reader(inotify.fd, self._on_readable)
 
     def _on_readable(self):
-        try:
-            data = os.read(self._fd, 4096)
-        except OSError:
-            return
-
-        changed = False
-        offset = 0
-        while offset + _INOTIFY_EVENT.size <= len(data):
-            _wd, _mask, _cookie, name_len = _INOTIFY_EVENT.unpack_from(data, offset)
-            offset += _INOTIFY_EVENT.size
-            name = data[offset:offset + name_len].split(b"\0", 1)[0].decode(errors="replace")
-            offset += name_len
-            if name == self._filename:
-                changed = True
-
+        changed = any(event.name == self._filename for event in self._inotify.read(timeout=0))
         if not changed:
             return
         new_exists = os.path.exists(os.path.join(self._dir, self._filename))
@@ -195,10 +151,10 @@ class VsmWatcher:
             self._on_change(new_exists)
 
     def stop(self):
-        if self._fd is not None:
-            asyncio.get_running_loop().remove_reader(self._fd)
-            os.close(self._fd)
-            self._fd = None
+        if self._inotify is not None:
+            asyncio.get_running_loop().remove_reader(self._inotify.fd)
+            self._inotify.close()
+            self._inotify = None
 
 
 class Controller:
@@ -355,11 +311,10 @@ class Controller:
     def ensure_vsm_watching(self):
         if DEBUG or self._vsm_watcher.is_active():
             return
-        vsm_path = find_vsm_path()
-        if not vsm_path:
+        if not mudfish_home.MUDFISH_VAR_DIR:
             log("could not locate mudfish install to watch VPN state")
             return
-        self._vsm_watcher.start(vsm_path)
+        self._vsm_watcher.start(os.path.join(mudfish_home.MUDFISH_VAR_DIR, ".mudfish.vsm"))
         self._vsm_exists = self._vsm_watcher.exists
 
     def _on_vsm_change(self, exists):
@@ -394,7 +349,7 @@ class Controller:
         log(f"launching broker via pkexec, socket={self._socket_path}")
         try:
             self._broker_proc = await asyncio.create_subprocess_exec(
-                "pkexec", BROKER_SCRIPT, self._socket_path, BROKER_LOG_PATH, str(uid)
+                "pkexec", BROKER_SCRIPT, self._socket_path, BROKER_LOG_PATH, str(uid), mudfish_home.MUDFISH_HOME or ""
             )
         except Exception as e:
             log(f"failed to launch broker: {e!r}")
@@ -712,7 +667,20 @@ async def main_async():
     await stop_event.wait()
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Mudfish VPN tray icon")
+    parser.add_argument(
+        "--mudfish-home",
+        metavar="PATH",
+        help="Mudfish install directory to use (e.g. /opt/mudfish/6.9.0) instead of "
+             "auto-detecting the newest one under /opt/mudfish/*",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    mudfish_home.configure(args.mudfish_home)
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:

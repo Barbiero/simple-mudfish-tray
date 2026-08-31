@@ -32,7 +32,8 @@ cd simple-mudfish-tray
 ```
 
 This creates a Python virtualenv inside the project directory, installs the
-few dependencies (`dbus-next`, `pillow`, `platformdirs`) into it, and writes
+few dependencies (`dbus-next`, `inotify_simple`, `pillow`, `platformdirs`)
+into it, and writes
 `~/.local/share/applications/mudfish-tray.desktop` so "Mudfish Tray" shows up
 in your application launcher. No root or privileged access is needed for the
 install itself — it only touches files under your home directory.
