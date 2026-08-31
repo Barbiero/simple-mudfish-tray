@@ -4,10 +4,21 @@ and DBusMenu D-Bus interfaces (no Qt/GTK) via dbus-next.
 
 Start/Stop/Quit are relayed to a root-privileged broker (mudfish-broker.py,
 launched once via pkexec per tray session) over a peer-credential-verified
-Unix socket, instead of shelling out to pkexec for every action."""
+Unix socket, instead of shelling out to pkexec for every action.
+
+The tray icon has four badge states: stopped (mudrun-headless is not
+running), starting/stopping (pending, transitional), started
+(mudrun-headless is up but no VPN item is active), and running
+(mudrun-headless is up and a VPN item is active). The last distinction is
+made by watching, via inotify, for the appearance/disappearance of
+{mudfish_folder}/var/.mudfish.vsm — the same file mudadm itself uses to
+detect a running item — since that file is world-readable and needs no
+broker/root involvement."""
 import asyncio
+import ctypes
 import os
 import signal
+import struct
 import sys
 import time
 import webbrowser
@@ -64,6 +75,15 @@ def find_logo():
     return max(matches, key=_mudfish_version_key, default=None)
 
 
+def find_vsm_path():
+    matches = glob("/opt/mudfish/*/bin/mudrun-headless")
+    binary = max(matches, key=_mudfish_version_key, default=None)
+    if not binary:
+        return None
+    mudfish_folder = os.path.dirname(os.path.dirname(binary))
+    return os.path.join(mudfish_folder, "var", ".mudfish.vsm")
+
+
 def rgba_to_argb_bytes(im):
     raw = im.tobytes()  # R,G,B,A per pixel
     out = bytearray(len(raw))
@@ -94,12 +114,85 @@ def make_pixmap(base_img, color):
     return [[w, h, rgba_to_argb_bytes(im)]]
 
 
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+_IN_NONBLOCK = 0o4000
+_IN_CREATE = 0x00000100
+_IN_DELETE = 0x00000200
+_IN_MOVED_FROM = 0x00000040
+_IN_MOVED_TO = 0x00000080
+_VSM_WATCH_MASK = _IN_CREATE | _IN_DELETE | _IN_MOVED_FROM | _IN_MOVED_TO
+_INOTIFY_EVENT = struct.Struct("iIII")  # wd, mask, cookie, name_len
+
+
+class VsmWatcher:
+    """Watches a directory via inotify for one file's creation/removal,
+    so we can tell whether a VPN item is running without polling (e.g. via
+    `ls`) or shelling out to `mudadm`."""
+
+    def __init__(self, on_change):
+        self._on_change = on_change
+        self._fd = None
+        self._dir = None
+        self._filename = None
+        self.exists = False
+
+    def is_active(self):
+        return self._fd is not None
+
+    def start(self, path):
+        self._dir, self._filename = os.path.split(path)
+        self.exists = os.path.exists(path)
+
+        fd = _libc.inotify_init1(_IN_NONBLOCK)
+        if fd < 0:
+            log(f"inotify_init1 failed: {os.strerror(ctypes.get_errno())}")
+            return
+        wd = _libc.inotify_add_watch(fd, self._dir.encode(), _VSM_WATCH_MASK)
+        if wd < 0:
+            log(f"could not watch {self._dir} for VPN state: {os.strerror(ctypes.get_errno())}")
+            os.close(fd)
+            return
+
+        self._fd = fd
+        asyncio.get_running_loop().add_reader(fd, self._on_readable)
+
+    def _on_readable(self):
+        try:
+            data = os.read(self._fd, 4096)
+        except OSError:
+            return
+
+        changed = False
+        offset = 0
+        while offset + _INOTIFY_EVENT.size <= len(data):
+            _wd, _mask, _cookie, name_len = _INOTIFY_EVENT.unpack_from(data, offset)
+            offset += _INOTIFY_EVENT.size
+            name = data[offset:offset + name_len].split(b"\0", 1)[0].decode(errors="replace")
+            offset += name_len
+            if name == self._filename:
+                changed = True
+
+        if not changed:
+            return
+        new_exists = os.path.exists(os.path.join(self._dir, self._filename))
+        if new_exists != self.exists:
+            self.exists = new_exists
+            self._on_change(new_exists)
+
+    def stop(self):
+        if self._fd is not None:
+            asyncio.get_running_loop().remove_reader(self._fd)
+            os.close(self._fd)
+            self._fd = None
+
+
 class Controller:
     """Holds shared mutable state used by both D-Bus interfaces."""
 
     def __init__(self):
         base = load_base_icon()
         self.pixmap_running = make_pixmap(base, (46, 204, 113, 255))
+        self.pixmap_started = make_pixmap(base, (52, 152, 219, 255))
         self.pixmap_stopped = make_pixmap(base, (231, 76, 60, 255))
         self.pixmap_pending = make_pixmap(base, (241, 196, 15, 255))
 
@@ -108,6 +201,12 @@ class Controller:
         self._pending = None  # None | "starting" | "stopping"
         self._pending_timeout_handle = None
         self._quit_after_stop = False
+
+        # VPN-item state: unrelated to mudrun-headless's own process state,
+        # kept separately and never simulated in DEBUG mode (starting a VPN
+        # item happens out of band, via the web configuration UI).
+        self._vsm_watcher = VsmWatcher(self._on_vsm_change)
+        self._vsm_exists = False
 
         self._broker_proc = None
         self._broker_writer = None
@@ -147,17 +246,24 @@ class Controller:
     def is_running(self):
         return self._fake_running if DEBUG else self._broker_running
 
+    def is_vpn_running(self):
+        return self._vsm_exists
+
     def current_pixmap(self):
         if self._pending:
             return self.pixmap_pending
-        return self.pixmap_running if self.is_running() else self.pixmap_stopped
+        if not self.is_running():
+            return self.pixmap_stopped
+        return self.pixmap_running if self.is_vpn_running() else self.pixmap_started
 
     def status_text(self):
         if self._pending == "starting":
             return "Starting…"
         if self._pending == "stopping":
             return "Stopping…"
-        return "Running" if self.is_running() else "Stopped"
+        if not self.is_running():
+            return "Stopped"
+        return "Running" if self.is_vpn_running() else "Started"
 
     def tooltip_text(self):
         return f"Mudfish VPN — {self.status_text().lower()}"
@@ -227,6 +333,23 @@ class Controller:
         if self._quit_after_stop:
             log("giving up on quit-after-stop; leaving tray open")
             self._quit_after_stop = False
+        self.notify_all()
+
+    # --- VPN item state (mudfish.vsm watcher) -------------------------------
+
+    def ensure_vsm_watching(self):
+        if DEBUG or self._vsm_watcher.is_active():
+            return
+        vsm_path = find_vsm_path()
+        if not vsm_path:
+            log("could not locate mudfish install to watch VPN state")
+            return
+        self._vsm_watcher.start(vsm_path)
+        self._vsm_exists = self._vsm_watcher.exists
+
+    def _on_vsm_change(self, exists):
+        log(f"VPN item state -> {'running' if exists else 'stopped'}")
+        self._vsm_exists = exists
         self.notify_all()
 
     def notify_all(self):
@@ -316,6 +439,8 @@ class Controller:
                 self._cancel_pending_timeout()
                 self._pending = None
                 self._broker_running = new_state
+                if new_state:
+                    self.ensure_vsm_watching()
                 if self._quit_after_stop and not new_state:
                     self._quit_after_stop = False
                     await self._send_broker_command("quit")
@@ -553,8 +678,10 @@ async def main_async():
 
     if DEBUG:
         log("DEBUG mode: will NOT touch mudrun-headless or ask for a password")
-    elif not controller.is_running():
-        controller.start_mudfish()
+    else:
+        controller.ensure_vsm_watching()
+        if not controller.is_running():
+            controller.start_mudfish()
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
