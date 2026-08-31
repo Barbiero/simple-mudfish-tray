@@ -22,27 +22,26 @@ import socket
 import struct
 import sys
 import time
+from asyncio.subprocess import Process
 
 import mudfish_home
 
 
-def find_binary():
-    if not mudfish_home.MUDFISH_BIN_DIR:
-        return None
+def find_binary() -> str | None:
     path = os.path.join(mudfish_home.MUDFISH_BIN_DIR, "mudrun-headless")
     return path if os.path.isfile(path) else None
 
 
 class Broker:
-    def __init__(self, socket_path, log_path, allowed_uid):
+    def __init__(self, socket_path: str, log_path: str, allowed_uid: int) -> None:
         self.socket_path = socket_path
         self.log_path = log_path
         self.allowed_uid = allowed_uid
-        self.proc = None
-        self.writer = None
+        self.proc: Process | None = None
+        self.writer: asyncio.StreamWriter | None = None
         self.shutdown_event = asyncio.Event()
 
-    def log(self, msg):
+    def log(self, msg: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
         print(line, file=sys.stderr, flush=True)
         try:
@@ -51,10 +50,10 @@ class Broker:
         except OSError:
             pass
 
-    def is_running(self):
+    def is_running(self) -> bool:
         return self.proc is not None and self.proc.returncode is None
 
-    async def _push_state(self):
+    async def _push_state(self) -> None:
         if not self.writer:
             return
         state = "running" if self.is_running() else "stopped"
@@ -64,14 +63,14 @@ class Broker:
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    async def _watch_proc(self, proc):
+    async def _watch_proc(self, proc: Process) -> None:
         await proc.wait()
         if self.proc is proc:
             self.log(f"mudrun-headless exited (code {proc.returncode})")
             self.proc = None
             await self._push_state()
 
-    async def start_mudfish(self):
+    async def start_mudfish(self) -> None:
         if self.is_running():
             return
         binary = find_binary()
@@ -85,8 +84,8 @@ class Broker:
         self.proc = await asyncio.create_subprocess_exec(binary)
         asyncio.ensure_future(self._watch_proc(self.proc))
 
-    async def stop_mudfish(self):
-        if not self.is_running():
+    async def stop_mudfish(self) -> None:
+        if not self.is_running() or self.proc is None:
             return
         self.log("stopping mudrun-headless")
         self.proc.terminate()
@@ -97,7 +96,7 @@ class Broker:
             self.proc.kill()
             await self.proc.wait()
 
-    async def handle_client(self, reader, writer):
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         sock = writer.get_extra_info("socket")
         creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
         _pid, uid, _gid = struct.unpack("3i", creds)
@@ -144,12 +143,12 @@ class Broker:
             await self.stop_mudfish()
             self.shutdown_event.set()
 
-    async def _shutdown_on_signal(self, sig_name):
+    async def _shutdown_on_signal(self, sig_name: str) -> None:
         self.log(f"received {sig_name}, stopping mudfish before exiting")
         await self.stop_mudfish()
         self.shutdown_event.set()
 
-    async def run(self):
+    async def run(self) -> None:
         try:
             os.unlink(self.socket_path)
         except FileNotFoundError:
@@ -164,9 +163,12 @@ class Broker:
         os.chmod(self.socket_path, 0o600)
         self.log(f"listening on {self.socket_path}, allowed_uid={self.allowed_uid}")
 
+        def handle_signal(name: str) -> None:
+            asyncio.ensure_future(self._shutdown_on_signal(name))
+
         loop = asyncio.get_running_loop()
         for sig, name in ((signal.SIGINT, "SIGINT"), (signal.SIGTERM, "SIGTERM")):
-            loop.add_signal_handler(sig, lambda name=name: asyncio.ensure_future(self._shutdown_on_signal(name)))
+            loop.add_signal_handler(sig, handle_signal, name)
 
         await self.shutdown_event.wait()
         self.log("shutting down")
@@ -185,11 +187,20 @@ class Broker:
             pass
 
 
-def main():
+def main() -> None:
     socket_path, log_path, allowed_uid = sys.argv[1], sys.argv[2], int(sys.argv[3])
     home_override = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
-    mudfish_home.configure(home_override)
+    try:
+        mudfish_home.configure(home_override)
+    except mudfish_home.MudfishNotFoundError as e:
+        print(f"mudfish-broker: {e}", file=sys.stderr)
+        sys.exit(1)
+
     broker = Broker(socket_path, log_path, allowed_uid)
+    if find_binary() is None:
+        broker.log("ERROR: mudrun-headless binary not found under /opt/mudfish")
+        sys.exit(1)
+
     try:
         asyncio.run(broker.run())
     except KeyboardInterrupt:

@@ -21,16 +21,23 @@ import signal
 import sys
 import time
 import webbrowser
+from typing import Any, Callable, Literal
 
 from inotify_simple import INotify, flags as inotify_flags
 from PIL import Image, ImageDraw
 from platformdirs import user_cache_dir, user_runtime_dir
 
-from dbus_next import BusType, PropertyAccess, Variant
-from dbus_next.aio import MessageBus
+from dbus_next.constants import BusType, PropertyAccess
+from dbus_next.signature import Variant
+from dbus_next.aio.message_bus import MessageBus
 from dbus_next.service import ServiceInterface, dbus_property, method, signal as dbus_signal
 
 import mudfish_home
+
+# dbus_next "a(iiay)" IconPixmap payload: a list of [width, height, argb_bytes].
+Pixmap = list[list[Any]]
+MenuItemProps = dict[str, Any]
+PendingState = Literal["starting", "stopping"]
 
 BROKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker.py")
 DEBUG = os.environ.get("MUDFISH_TRAY_DEBUG") == "1"
@@ -40,6 +47,18 @@ BROKER_LOG_PATH = os.path.join(CACHE_DIR, "mudfish-broker.log")
 
 SNI_PATH = "/StatusNotifierItem"
 MENU_PATH = "/MenuBar"
+
+# D-Bus signatures used as return-type annotations below. Simple ones (e.g.
+# "s", "a(iiay)") are written inline as string literals, matching normal
+# dbus_next style — but these three contain nested ( )/{ } that pyright's
+# forward-reference parser reads as broken Python expression syntax (a hard
+# parse error, not a suppressible diagnostic) when used as a literal. Naming
+# them sidesteps that: dbus_next's runtime introspection just needs the
+# annotation to evaluate to a plain str, which a name reference still does.
+_TOOLTIP_SIG = "(sa(iiay)ss)"
+_LAYOUT_SIG = "u(ia{sv}av)"
+_GROUP_PROPS_SIG = "a(ia{sv})"
+_ARRAY_STR_SIG = "as"  # "as" is also a Python keyword, so it hits the same parser issue
 
 PENDING_TIMEOUT_S = 30  # give up waiting for the broker to confirm start/stop
 CONFIG_URL = "http://localhost:8282"
@@ -52,7 +71,7 @@ ID_SEP2 = 4
 ID_QUIT = 5
 
 
-def log(msg):
+def log(msg: str) -> None:
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(line, file=sys.stderr, flush=True)
     try:
@@ -63,7 +82,7 @@ def log(msg):
         pass
 
 
-def rgba_to_argb_bytes(im):
+def rgba_to_argb_bytes(im: Image.Image) -> bytes:
     raw = im.tobytes()  # R,G,B,A per pixel
     out = bytearray(len(raw))
     out[0::4] = raw[3::4]  # A
@@ -73,15 +92,15 @@ def rgba_to_argb_bytes(im):
     return bytes(out)
 
 
-def load_base_icon():
+def load_base_icon() -> Image.Image:
     size = (64, 64)
-    path = os.path.join(mudfish_home.MUDFISH_SHARE_DIR, "mudrun_logo.png") if mudfish_home.MUDFISH_SHARE_DIR else None
-    if path and os.path.isfile(path):
+    path = os.path.join(mudfish_home.MUDFISH_SHARE_DIR, "mudrun_logo.png")
+    if os.path.isfile(path):
         return Image.open(path).convert("RGBA").resize(size)
     return Image.new("RGBA", size, (100, 100, 100, 255))
 
 
-def make_pixmap(base_img, color, fill_alpha=None):
+def make_pixmap(base_img: Image.Image, color: tuple[int, int, int, int], fill_alpha: int | None = None) -> Pixmap:
     """Draw a status dot in the corner of base_img. With fill_alpha=None,
     the dot is solidly filled with color. Otherwise it's drawn as a ring
     (full-opacity outline) around a center filled at fill_alpha, blended
@@ -112,17 +131,17 @@ class VsmWatcher:
 
     _WATCH_FLAGS = inotify_flags.CREATE | inotify_flags.DELETE | inotify_flags.MOVED_TO | inotify_flags.MOVED_FROM
 
-    def __init__(self, on_change):
+    def __init__(self, on_change: Callable[[bool], None]) -> None:
         self._on_change = on_change
-        self._inotify = None
-        self._dir = None
-        self._filename = None
+        self._inotify: INotify | None = None
+        self._dir: str | None = None
+        self._filename: str | None = None
         self.exists = False
 
-    def is_active(self):
+    def is_active(self) -> bool:
         return self._inotify is not None
 
-    def start(self, path):
+    def start(self, path: str) -> None:
         self._dir, self._filename = os.path.split(path)
         self.exists = os.path.exists(path)
 
@@ -141,7 +160,8 @@ class VsmWatcher:
         self._inotify = inotify
         asyncio.get_running_loop().add_reader(inotify.fd, self._on_readable)
 
-    def _on_readable(self):
+    def _on_readable(self) -> None:
+        assert self._inotify is not None and self._dir is not None and self._filename is not None
         changed = any(event.name == self._filename for event in self._inotify.read(timeout=0))
         if not changed:
             return
@@ -150,7 +170,7 @@ class VsmWatcher:
             self.exists = new_exists
             self._on_change(new_exists)
 
-    def stop(self):
+    def stop(self) -> None:
         if self._inotify is not None:
             asyncio.get_running_loop().remove_reader(self._inotify.fd)
             self._inotify.close()
@@ -160,7 +180,7 @@ class VsmWatcher:
 class Controller:
     """Holds shared mutable state used by both D-Bus interfaces."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         base = load_base_icon()
         self.pixmap_running = make_pixmap(base, (46, 204, 113, 255))
         self.pixmap_started = make_pixmap(base, (46, 204, 113, 255), fill_alpha=30)
@@ -169,8 +189,8 @@ class Controller:
 
         self._fake_running = False  # DEBUG mode only
         self._broker_running = False  # authoritative in real mode, pushed by the broker
-        self._pending = None  # None | "starting" | "stopping"
-        self._pending_timeout_handle = None
+        self._pending: PendingState | None = None
+        self._pending_timeout_handle: asyncio.TimerHandle | None = None
         self._quit_after_stop = False
 
         # VPN-item state: unrelated to mudrun-headless's own process state,
@@ -179,19 +199,19 @@ class Controller:
         self._vsm_watcher = VsmWatcher(self._on_vsm_change)
         self._vsm_exists = False
 
-        self._broker_proc = None
-        self._broker_writer = None
-        self._socket_path = None
+        self._broker_proc: asyncio.subprocess.Process | None = None
+        self._broker_writer: asyncio.StreamWriter | None = None
+        self._socket_path: str | None = None
 
-        self.sni = None
-        self.menu = None
-        self.quit_event = None
+        self.sni: "StatusNotifierItem | None" = None
+        self.menu: "DBusMenu | None" = None
+        self.quit_event: asyncio.Event | None = None
 
-    def request_quit(self):
+    def request_quit(self) -> None:
         if self.quit_event:
             self.quit_event.set()
 
-    def request_quit_all(self):
+    def request_quit_all(self) -> None:
         if DEBUG:
             if not self.is_running() and self._pending is None:
                 self.request_quit()
@@ -202,7 +222,7 @@ class Controller:
             return
         asyncio.ensure_future(self._quit_all_async())
 
-    async def _quit_all_async(self):
+    async def _quit_all_async(self) -> None:
         if self._broker_writer is None:
             self.request_quit()
             return
@@ -214,20 +234,20 @@ class Controller:
         await self._send_broker_command("quit")
         self.request_quit()
 
-    def is_running(self):
+    def is_running(self) -> bool:
         return self._fake_running if DEBUG else self._broker_running
 
-    def is_vpn_running(self):
+    def is_vpn_running(self) -> bool:
         return self._vsm_exists
 
-    def current_pixmap(self):
+    def current_pixmap(self) -> Pixmap:
         if self._pending:
             return self.pixmap_pending
         if not self.is_running():
             return self.pixmap_stopped
         return self.pixmap_running if self.is_vpn_running() else self.pixmap_started
 
-    def status_text(self):
+    def status_text(self) -> str:
         if self._pending == "starting":
             return "Starting…"
         if self._pending == "stopping":
@@ -236,10 +256,10 @@ class Controller:
             return "Stopped"
         return "Running" if self.is_vpn_running() else "Started"
 
-    def tooltip_text(self):
+    def tooltip_text(self) -> str:
         return f"Mudfish VPN — {self.status_text().lower()}"
 
-    def menu_items(self):
+    def menu_items(self) -> list[tuple[int, MenuItemProps]]:
         running = self.is_running()
         pending = self._pending is not None
         return [
@@ -250,7 +270,7 @@ class Controller:
             (ID_QUIT, {"label": "Quit", "enabled": True}),
         ]
 
-    def start_mudfish(self):
+    def start_mudfish(self) -> None:
         self._enter_pending("starting")
         if DEBUG:
             log("DEBUG: pretending to start (no pkexec)")
@@ -258,12 +278,12 @@ class Controller:
             return
         asyncio.ensure_future(self._send_broker_command("start"))
 
-    def open_configuration(self):
+    def open_configuration(self) -> None:
         if not self.is_running():
             return
         webbrowser.open(CONFIG_URL)
 
-    def stop_mudfish(self):
+    def stop_mudfish(self) -> None:
         self._enter_pending("stopping")
         if DEBUG:
             log("DEBUG: pretending to stop (no pkexec)")
@@ -271,7 +291,7 @@ class Controller:
             return
         asyncio.ensure_future(self._send_broker_command("stop"))
 
-    def _debug_set_running(self, value):
+    def _debug_set_running(self, value: bool) -> None:
         log(f"DEBUG: fake_running -> {value}")
         self._fake_running = value
         self._pending = None
@@ -281,7 +301,7 @@ class Controller:
             return
         self.notify_all()
 
-    def _enter_pending(self, pending):
+    def _enter_pending(self, pending: PendingState) -> None:
         self._cancel_pending_timeout()
         self._pending = pending
         self.notify_all()
@@ -290,12 +310,12 @@ class Controller:
                 PENDING_TIMEOUT_S, self._on_pending_timeout
             )
 
-    def _cancel_pending_timeout(self):
+    def _cancel_pending_timeout(self) -> None:
         if self._pending_timeout_handle:
             self._pending_timeout_handle.cancel()
             self._pending_timeout_handle = None
 
-    def _on_pending_timeout(self):
+    def _on_pending_timeout(self) -> None:
         self._pending_timeout_handle = None
         if not self._pending:
             return
@@ -308,21 +328,18 @@ class Controller:
 
     # --- VPN item state (mudfish.vsm watcher) -------------------------------
 
-    def ensure_vsm_watching(self):
+    def ensure_vsm_watching(self) -> None:
         if DEBUG or self._vsm_watcher.is_active():
-            return
-        if not mudfish_home.MUDFISH_VAR_DIR:
-            log("could not locate mudfish install to watch VPN state")
             return
         self._vsm_watcher.start(os.path.join(mudfish_home.MUDFISH_VAR_DIR, ".mudfish.vsm"))
         self._vsm_exists = self._vsm_watcher.exists
 
-    def _on_vsm_change(self, exists):
+    def _on_vsm_change(self, exists: bool) -> None:
         log(f"VPN item state -> {'running' if exists else 'stopped'}")
         self._vsm_exists = exists
         self.notify_all()
 
-    def notify_all(self):
+    def notify_all(self) -> None:
         if self.sni:
             self.sni.NewIcon()
             self.sni.NewToolTip()
@@ -332,12 +349,12 @@ class Controller:
 
     # --- broker connection management -------------------------------------
 
-    async def ensure_broker(self):
+    async def ensure_broker(self) -> bool:
         if self._broker_writer is not None:
             return True
         return await self._launch_and_connect_broker()
 
-    async def _launch_and_connect_broker(self):
+    async def _launch_and_connect_broker(self) -> bool:
         uid = os.getuid()
         runtime_dir = user_runtime_dir("mudfish-tray")
         try:
@@ -349,7 +366,7 @@ class Controller:
         log(f"launching broker via pkexec, socket={self._socket_path}")
         try:
             self._broker_proc = await asyncio.create_subprocess_exec(
-                "pkexec", BROKER_SCRIPT, self._socket_path, BROKER_LOG_PATH, str(uid), mudfish_home.MUDFISH_HOME or ""
+                "pkexec", BROKER_SCRIPT, self._socket_path, BROKER_LOG_PATH, str(uid), mudfish_home.MUDFISH_HOME
             )
         except Exception as e:
             log(f"failed to launch broker: {e!r}")
@@ -376,8 +393,8 @@ class Controller:
         asyncio.ensure_future(self._read_broker(reader))
         return True
 
-    async def _send_broker_command(self, cmd):
-        if not await self.ensure_broker():
+    async def _send_broker_command(self, cmd: str) -> None:
+        if not await self.ensure_broker() or self._broker_writer is None:
             log(f"could not send '{cmd}': broker unavailable")
             self._cancel_pending_timeout()
             self._pending = None
@@ -390,7 +407,7 @@ class Controller:
             log(f"broker connection lost while sending '{cmd}'")
             self._broker_writer = None
 
-    async def _read_broker(self, reader):
+    async def _read_broker(self, reader: asyncio.StreamReader) -> None:
         while True:
             line = await reader.readline()
             if not line:
@@ -424,7 +441,7 @@ class Controller:
 
 
 class StatusNotifierItem(ServiceInterface):
-    def __init__(self, controller):
+    def __init__(self, controller: Controller) -> None:
         super().__init__("org.kde.StatusNotifierItem")
         self.controller = controller
 
@@ -481,7 +498,7 @@ class StatusNotifierItem(ServiceInterface):
         return ""
 
     @dbus_property(access=PropertyAccess.READ)
-    def ToolTip(self) -> "(sa(iiay)ss)":
+    def ToolTip(self) -> _TOOLTIP_SIG:
         return ["", [], "Mudfish VPN", self.controller.tooltip_text()]
 
     @dbus_property(access=PropertyAccess.READ)
@@ -493,48 +510,48 @@ class StatusNotifierItem(ServiceInterface):
         return MENU_PATH
 
     @method()
-    def Activate(self, x: "i", y: "i"):
+    def Activate(self, x: "i", y: "i") -> None:
         pass
 
     @method()
-    def SecondaryActivate(self, x: "i", y: "i"):
+    def SecondaryActivate(self, x: "i", y: "i") -> None:
         pass
 
     @method()
-    def ContextMenu(self, x: "i", y: "i"):
+    def ContextMenu(self, x: "i", y: "i") -> None:
         pass
 
     @method()
-    def Scroll(self, delta: "i", orientation: "s"):
+    def Scroll(self, delta: "i", orientation: "s") -> None:
         pass
 
     @dbus_signal()
-    def NewIcon(self):
+    def NewIcon(self) -> None:
         pass
 
     @dbus_signal()
-    def NewToolTip(self):
+    def NewToolTip(self) -> None:
         pass
 
     @dbus_signal()
-    def NewStatus(self, status) -> "s":
+    def NewStatus(self, status: str) -> "s":
         return status
 
 
 class DBusMenu(ServiceInterface):
-    def __init__(self, controller):
+    def __init__(self, controller: Controller) -> None:
         super().__init__("com.canonical.dbusmenu")
         self.controller = controller
         self.revision = 0
 
-    def _item_props(self, base_props, names_filter):
-        props = {"enabled": True, "visible": True, "type": "standard"}
+    def _item_props(self, base_props: MenuItemProps, names_filter: list[str] | None) -> dict[str, Variant]:
+        props: MenuItemProps = {"enabled": True, "visible": True, "type": "standard"}
         props.update(base_props)
         if names_filter:
             props = {k: v for k, v in props.items() if k in names_filter}
         return {k: Variant(_prop_sig(k), v) for k, v in props.items()}
 
-    def _build_item(self, item_id, base_props, names_filter):
+    def _build_item(self, item_id: int, base_props: MenuItemProps, names_filter: list[str] | None) -> list[Any]:
         return [item_id, self._item_props(base_props, names_filter), []]
 
     @dbus_property(access=PropertyAccess.READ)
@@ -550,11 +567,11 @@ class DBusMenu(ServiceInterface):
         return "normal"
 
     @dbus_property(access=PropertyAccess.READ)
-    def IconThemePath(self) -> "as":
+    def IconThemePath(self) -> _ARRAY_STR_SIG:
         return []
 
     @method()
-    def GetLayout(self, parent_id: "i", recursion_depth: "i", property_names: "as") -> "u(ia{sv}av)":
+    def GetLayout(self, parent_id: "i", recursion_depth: "i", property_names: _ARRAY_STR_SIG) -> _LAYOUT_SIG:
         items = self.controller.menu_items()
         if parent_id == 0:
             children = [
@@ -569,7 +586,7 @@ class DBusMenu(ServiceInterface):
         return [self.revision, [parent_id, {}, []]]
 
     @method()
-    def GetGroupProperties(self, ids: "ai", property_names: "as") -> "a(ia{sv})":
+    def GetGroupProperties(self, ids: "ai", property_names: _ARRAY_STR_SIG) -> _GROUP_PROPS_SIG:
         items = dict(self.controller.menu_items())
         result = []
         for iid in ids:
@@ -584,7 +601,7 @@ class DBusMenu(ServiceInterface):
         return props.get(name, Variant("s", ""))
 
     @method()
-    def Event(self, item_id: "i", event_id: "s", data: "v", timestamp: "u"):
+    def Event(self, item_id: "i", event_id: "s", data: "v", timestamp: "u") -> None:
         if event_id != "clicked":
             return
         if item_id == ID_TOGGLE:
@@ -602,19 +619,19 @@ class DBusMenu(ServiceInterface):
         return False
 
     @dbus_signal()
-    def LayoutUpdated(self, revision, parent) -> "ui":
+    def LayoutUpdated(self, revision: int, parent: int) -> "ui":
         return [revision, parent]
 
-    def push_layout_update(self):
+    def push_layout_update(self) -> None:
         self.revision += 1
         self.LayoutUpdated(self.revision, 0)
 
 
-def _prop_sig(name):
+def _prop_sig(name: str) -> str:
     return {"enabled": "b", "visible": "b"}.get(name, "s")
 
 
-async def main_async():
+async def main_async() -> None:
     log(f"--- starting mudfish-tray.py (DEBUG={DEBUG}) ---")
     controller = Controller()
 
@@ -638,7 +655,9 @@ async def main_async():
         introspection = await bus.introspect(watcher_bus_name, "/StatusNotifierWatcher")
         proxy = bus.get_proxy_object(watcher_bus_name, "/StatusNotifierWatcher", introspection)
         watcher_intf = proxy.get_interface("org.kde.StatusNotifierWatcher")
-        await watcher_intf.call_register_status_notifier_item(service_name)
+        # call_register_status_notifier_item is generated at runtime from the
+        # introspected D-Bus interface, so it isn't visible to the type checker.
+        await watcher_intf.call_register_status_notifier_item(service_name)  # type: ignore[attr-defined]
         log(f"registered with {watcher_bus_name}")
     except Exception as e:
         log(f"could not register with {watcher_bus_name}: {e!r}")
@@ -657,7 +676,7 @@ async def main_async():
     stop_event = asyncio.Event()
     controller.quit_event = stop_event
 
-    def _handle_sigint():
+    def _handle_sigint() -> None:
         log("shutdown signal received")
         stop_event.set()
 
@@ -667,7 +686,7 @@ async def main_async():
     await stop_event.wait()
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Mudfish VPN tray icon")
     parser.add_argument(
         "--mudfish-home",
@@ -678,9 +697,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
-    mudfish_home.configure(args.mudfish_home)
+    try:
+        mudfish_home.configure(args.mudfish_home)
+    except mudfish_home.MudfishNotFoundError as e:
+        print(f"mudfish-tray: {e}", file=sys.stderr)
+        sys.exit(1)
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:

@@ -1,0 +1,20 @@
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+stubPath = "stubs"
+pythonVersion = "3.13"
+
+[[tool.pyright.executionEnvironments]]
+# dbus_next's @method/@dbus_property/@signal decorators repurpose the
+# parameter/return annotations of the methods they decorate as D-Bus
+# type-signature strings (e.g. `def Category(self) -> "s":`), not real Python
+# types, and wrap the method body in a way pyright can't see through — so it
+# misreads the annotations as broken forward references and loses track of
+# `self` binding on calls to the decorated methods. All suppressed here,
+# scoped to this file only.
+root = "tray.py"
+extraPaths = ["."]
+reportUndefinedVariable = "none"
+reportInvalidTypeForm = "none"
+reportUntypedFunctionDecorator = "none"
+reportCallIssue = "none"
