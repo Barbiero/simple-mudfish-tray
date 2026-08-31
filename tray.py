@@ -105,12 +105,27 @@ def load_base_icon():
     return im
 
 
-def make_pixmap(base_img, color):
+def make_pixmap(base_img, color, fill_alpha=None):
+    """Draw a status dot in the corner of base_img. With fill_alpha=None,
+    the dot is solidly filled with color. Otherwise it's drawn as a ring
+    (full-opacity outline) around a center filled at fill_alpha, blended
+    over the icon beneath — used for "up but not fully active yet" states."""
     im = base_img.copy()
-    draw = ImageDraw.Draw(im)
     w, h = im.size
     dot = int(w * 0.42)
-    draw.ellipse([w - dot, h - dot, w, h], fill=color)
+    box = [w - dot, h - dot, w, h]
+
+    if fill_alpha is None:
+        draw = ImageDraw.Draw(im)
+        draw.ellipse(box, fill=color)
+        return [[w, h, rgba_to_argb_bytes(im)]]
+
+    r, g, b = color[:3]
+    overlay = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    outline_width = max(1, dot // 8)
+    draw.ellipse(box, fill=(r, g, b, fill_alpha), outline=(r, g, b, 255), width=outline_width)
+    im = Image.alpha_composite(im, overlay)
     return [[w, h, rgba_to_argb_bytes(im)]]
 
 
@@ -192,7 +207,7 @@ class Controller:
     def __init__(self):
         base = load_base_icon()
         self.pixmap_running = make_pixmap(base, (46, 204, 113, 255))
-        self.pixmap_started = make_pixmap(base, (52, 152, 219, 255))
+        self.pixmap_started = make_pixmap(base, (46, 204, 113, 255), fill_alpha=30)
         self.pixmap_stopped = make_pixmap(base, (231, 76, 60, 255))
         self.pixmap_pending = make_pixmap(base, (241, 196, 15, 255))
 
